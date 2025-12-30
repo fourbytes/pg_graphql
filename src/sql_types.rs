@@ -1,6 +1,6 @@
 use bimap::BiBTreeMap;
-use cached::proc_macro::cached;
 use cached::SizedCache;
+use cached::proc_macro::cached;
 use lazy_static::lazy_static;
 use pgrx::*;
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,9 @@ pub struct FunctionDirectives {
     pub name: Option<String>,
     // @graphql({"description": "the address of ..." })
     pub description: Option<String>,
+    // @graphql({"preserveOrder": true}) - skip default PK ordering for SETOF functions
+    #[serde(default)]
+    pub preserve_order: bool,
 }
 
 #[derive(Deserialize, Clone, Debug, Eq, PartialEq, Hash)]
@@ -929,15 +932,20 @@ pub fn load_sql_context(_config: &Config) -> GraphQLResult<Arc<Context>> {
                 // We weren't able to find the OID of the element type, which is also odd because we just got
                 // it from the context. This means it's a bug as well. Report it.
                 pgrx::warning!(
-                        "Assertion violation: referenced element type with OID {} of array type with OID {} is not found",
-                        element_oid, array_oid);
+                    "Assertion violation: referenced element type with OID {} of array type with OID {} is not found",
+                    element_oid,
+                    array_oid
+                );
                 continue;
             }
 
             // Here we are asserting that we did in fact return the element type back to the list. Part of being
             // defensive here.
             if !context.types.contains_key(&element_oid) {
-                pgrx::warning!("Assertion violation: referenced element type with OID {} was not returned to the list of types", element_oid );
+                pgrx::warning!(
+                    "Assertion violation: referenced element type with OID {} was not returned to the list of types",
+                    element_oid
+                );
                 continue;
             }
         }

@@ -433,7 +433,8 @@ select
                                 select
                                     jsonb_build_object(
                                         'name', d.directive ->> 'name',
-                                        'description', d.directive ->> 'description'
+                                        'description', d.directive ->> 'description',
+                                        'preserve_order', coalesce((d.directive ->> 'preserveOrder')::boolean, false)
                                     )
                                 from
                                     directives d

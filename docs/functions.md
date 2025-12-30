@@ -470,6 +470,68 @@ If there is no sensible default, and you still want to make the argument optiona
 Currently, null defaults are only supported as simple expressions, as shown in the previous example.
 
 
+## Preserving Function Ordering
+
+By default, pg_graphql applies primary key ordering to `SETOF` function results for consistent cursor pagination. If your function defines its own `ORDER BY` clause and you want to preserve that ordering, use the `preserveOrder` directive:
+
+=== "Function"
+
+    ```sql
+    create table item(
+        id serial primary key,
+        name text not null,
+        rank int not null
+    );
+
+    create function search_items()
+        returns setof item
+        language sql stable
+    as $$ select * from item order by rank asc; $$;
+
+    comment on function search_items is '@graphql({"preserveOrder": true})';
+    ```
+
+=== "Query"
+
+    ```graphql
+    query {
+      searchItems {
+        edges {
+          node {
+            name
+            rank
+          }
+        }
+      }
+    }
+    ```
+
+=== "Response"
+
+    ```json
+    {
+      "data": {
+        "searchItems": {
+          "edges": [
+            { "node": { "name": "beta", "rank": 1 } },
+            { "node": { "name": "gamma", "rank": 2 } },
+            { "node": { "name": "alpha", "rank": 3 } }
+          ]
+        }
+      }
+    }
+    ```
+
+When `preserveOrder` is enabled:
+
+- **No `orderBy` argument provided**: The function's internal ORDER BY is preserved
+- **`orderBy` argument provided**: The user-specified ordering overrides the function's order
+
+!!! warning
+
+    When using `preserveOrder`, ensure your function's ORDER BY clause includes unique columns (like the primary key) for stable cursor pagination. Without unique columns, pagination cursors may produce inconsistent results.
+
+
 ## Limitations
 
 The following features are not yet supported. Any function using these features is not exposed in the API:
