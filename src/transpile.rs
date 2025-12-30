@@ -148,7 +148,6 @@ impl Table {
         )
     }
 
-    #[allow(clippy::only_used_in_recursion)]
     fn to_pagination_clause(
         &self,
         block_name: &str,
@@ -157,7 +156,26 @@ impl Table {
         param_context: &mut ParamContext,
         allow_equality: bool,
     ) -> GraphQLResult<String> {
-        // When paginating, allowe_equality should be false because we don't want to
+        self.to_pagination_clause_at(
+            block_name,
+            order_by,
+            cursor,
+            param_context,
+            allow_equality,
+            0,
+        )
+    }
+
+    fn to_pagination_clause_at(
+        &self,
+        block_name: &str,
+        order_by: &OrderByBuilder,
+        cursor: &Cursor,
+        param_context: &mut ParamContext,
+        allow_equality: bool,
+        index: usize,
+    ) -> GraphQLResult<String> {
+        // When paginating, allow_equality should be false because we don't want to
         // include the cursor's record in the page
         //
         // when checking to see if a previous page exists, allow_equality should be
@@ -172,33 +190,34 @@ impl Table {
 
         )"
         */
-        if cursor.elems.is_empty() {
+
+        // Base case: processed all cursor elements
+        if index >= cursor.elems.len() {
             return Ok(format!("{allow_equality}"));
         }
-        let mut next_cursor = cursor.clone();
-        let cursor_elem = next_cursor.elems.remove(0);
 
-        if order_by.elems.is_empty() {
+        if index >= order_by.elems.len() {
             return Err(GraphQLError::validation(
                 "orderBy clause incompatible with pagination cursor",
             ));
         }
-        let mut next_order_by = order_by.clone();
-        let order_elem = next_order_by.elems.remove(0);
 
-        let column = order_elem.column;
+        // Access by index - no cloning needed
+        let cursor_elem = &cursor.elems[index];
+        let order_elem = &order_by.elems[index];
+
+        let column = &order_elem.column;
         let quoted_col = quote_ident(&column.name);
 
-        let val = cursor_elem.value;
+        let val_clause = param_context.clause_for(&cursor_elem.value, &column.type_name)?;
 
-        let val_clause = param_context.clause_for(&val, &column.type_name)?;
-
-        let recurse_clause = self.to_pagination_clause(
+        let recurse_clause = self.to_pagination_clause_at(
             block_name,
-            &next_order_by,
-            &next_cursor,
+            order_by,
+            cursor,
             param_context,
             allow_equality,
+            index + 1,
         )?;
 
         let nulls_first: bool = order_elem.direction.nulls_first();
@@ -1070,7 +1089,8 @@ impl ConnectionBuilder {
 
         let join_clause = self.to_join_clause(&quoted_block_name, &quoted_parent_block_name)?;
 
-        let cursor = &self.before.clone().or_else(|| self.after.clone());
+        // Use as_ref() to avoid cloning cursor Options
+        let cursor: Option<&Cursor> = self.before.as_ref().or_else(|| self.after.as_ref());
 
         let object_clause = self.object_clause(&quoted_block_name, param_context)?;
         let aggregate_select_list = self.aggregate_select_list(&quoted_block_name)?;
@@ -1085,14 +1105,19 @@ impl ConnectionBuilder {
             self.source.table.to_primary_key_tuple_clause("__records");
 
         let pagination_clause = {
-            let order_by = match self.is_reverse_pagination() {
-                true => self.order_by.reverse(),
-                false => self.order_by.clone(),
+            // Use borrow pattern to avoid cloning order_by for forward pagination
+            let reversed;
+            let order_by: &OrderByBuilder = match self.is_reverse_pagination() {
+                true => {
+                    reversed = self.order_by.reverse();
+                    &reversed
+                }
+                false => &self.order_by,
             };
             match cursor {
                 Some(cursor) => self.source.table.to_pagination_clause(
                     &quoted_block_name,
-                    &order_by,
+                    order_by,
                     cursor,
                     param_context,
                     false,
@@ -1305,16 +1330,28 @@ impl PageInfoSelection {
 
         let cursor_clause = table.to_cursor_clause(block_name, order_by);
 
+        // Handle empty order_by (e.g., when preserveOrder is true with no explicit orderBy)
+        let order_by_sql = if order_by_clause.is_empty() {
+            String::new()
+        } else {
+            format!("order by {order_by_clause}")
+        };
+        let order_by_sql_reversed = if order_by_clause_reversed.is_empty() {
+            String::new()
+        } else {
+            format!("order by {order_by_clause_reversed}")
+        };
+
         Ok(match self {
             Self::StartCursor { alias } => {
                 format!(
-                    "{}, case when __has_records.has_records then (array_agg({cursor_clause} order by {order_by_clause}))[1] else null end",
+                    "{}, case when __has_records.has_records then (array_agg({cursor_clause} {order_by_sql}))[1] else null end",
                     quote_literal(alias)
                 )
             }
             Self::EndCursor { alias } => {
                 format!(
-                    "{}, case when __has_records.has_records then (array_agg({cursor_clause} order by {order_by_clause_reversed}))[1] else null end",
+                    "{}, case when __has_records.has_records then (array_agg({cursor_clause} {order_by_sql_reversed}))[1] else null end",
                     quote_literal(alias)
                 )
             }
@@ -1389,6 +1426,13 @@ impl EdgeBuilder {
         let x = frags.join(", ");
         let order_by_clause = order_by.to_order_by_clause(block_name);
 
+        // Handle empty order_by (e.g., when preserveOrder is true with no explicit orderBy)
+        let order_by_sql = if order_by_clause.is_empty() {
+            String::new()
+        } else {
+            format!("order by {order_by_clause}")
+        };
+
         // Get the first primary key column name to use in the filter
         let first_pk_col = table.primary_key_columns().first().map(|col| &col.name);
 
@@ -1407,7 +1451,7 @@ impl EdgeBuilder {
             "coalesce(
                 jsonb_agg(
                     jsonb_build_object({x})
-                    order by {order_by_clause}
+                    {order_by_sql}
                 ) {filter_clause},
                 jsonb_build_array()
             )"

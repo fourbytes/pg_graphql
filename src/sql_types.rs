@@ -627,7 +627,7 @@ pub struct Config {
     pub schema_version: i32,
 }
 
-#[derive(Deserialize, Debug, Eq, PartialEq)]
+#[derive(Deserialize, Debug)]
 pub struct Context {
     pub config: Config,
     pub schemas: HashMap<u32, Schema>,
@@ -637,82 +637,102 @@ pub struct Context {
     pub enums: HashMap<u32, Arc<Enum>>,
     pub composites: Vec<Arc<Composite>>,
     pub functions: Vec<Arc<Function>>,
+    #[serde(skip)]
+    cached_all_foreign_keys: sync::OnceLock<Vec<Arc<ForeignKey>>>,
 }
 
 impl Hash for Context {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Only the config is needed to has ha Context
+        // Only the config is needed to hash a Context
         self.config.hash(state);
     }
 }
 
-impl Context {
-    /// Collect all foreign keys referencing (inbound or outbound) a table
-    pub fn foreign_keys(&self) -> Vec<Arc<ForeignKey>> {
-        let mut fkeys: Vec<Arc<ForeignKey>> = self.foreign_keys.clone();
+impl PartialEq for Context {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare all fields except cached_all_foreign_keys (derived from other fields)
+        self.config == other.config
+            && self.schemas == other.schemas
+            && self.tables == other.tables
+            && self.foreign_keys == other.foreign_keys
+            && self.types == other.types
+            && self.enums == other.enums
+            && self.composites == other.composites
+            && self.functions == other.functions
+    }
+}
 
-        // Add foreign keys defined in comment directives
-        for table in self.tables.values() {
-            let directive_fkeys: Vec<TableDirectiveForeignKey> =
-                match &table.directives.foreign_keys {
-                    Some(keys) => keys.clone(),
-                    None => vec![],
+impl Eq for Context {}
+
+impl Context {
+    /// Collect all foreign keys referencing (inbound or outbound) a table.
+    /// Results are cached via OnceLock to avoid repeated Vec allocations.
+    pub fn foreign_keys(&self) -> &[Arc<ForeignKey>] {
+        self.cached_all_foreign_keys.get_or_init(|| {
+            let mut fkeys: Vec<Arc<ForeignKey>> = self.foreign_keys.clone();
+
+            // Add foreign keys defined in comment directives
+            for table in self.tables.values() {
+                let directive_fkeys = match &table.directives.foreign_keys {
+                    Some(keys) => keys.as_slice(),
+                    None => &[],
                 };
 
-            for directive_fkey in directive_fkeys.iter() {
-                let referenced_t = match self.get_table_by_name(
-                    &directive_fkey.foreign_schema,
-                    &directive_fkey.foreign_table,
-                ) {
-                    Some(t) => t,
-                    None => {
-                        // No table found with requested name. Skip.
+                for directive_fkey in directive_fkeys.iter() {
+                    let referenced_t = match self.get_table_by_name(
+                        &directive_fkey.foreign_schema,
+                        &directive_fkey.foreign_table,
+                    ) {
+                        Some(t) => t,
+                        None => {
+                            // No table found with requested name. Skip.
+                            continue;
+                        }
+                    };
+
+                    let referenced_t_column_names: HashSet<&String> =
+                        referenced_t.columns.iter().map(|x| &x.name).collect();
+
+                    // Verify all foreign column references are valid
+                    if !directive_fkey
+                        .foreign_columns
+                        .iter()
+                        .all(|col| referenced_t_column_names.contains(col))
+                    {
+                        // Skip if invalid references exist
                         continue;
                     }
-                };
 
-                let referenced_t_column_names: HashSet<&String> =
-                    referenced_t.columns.iter().map(|x| &x.name).collect();
+                    let fk = ForeignKey {
+                        local_table_meta: ForeignKeyTableInfo {
+                            oid: table.oid,
+                            name: table.name.clone(),
+                            schema: table.schema.clone(),
+                            is_rls_enabled: table.is_rls_enabled,
+                            column_names: directive_fkey.local_columns.clone(),
+                        },
+                        referenced_table_meta: ForeignKeyTableInfo {
+                            oid: referenced_t.oid,
+                            name: referenced_t.name.clone(),
+                            schema: referenced_t.schema.clone(),
+                            is_rls_enabled: table.is_rls_enabled,
+                            column_names: directive_fkey.foreign_columns.clone(),
+                        },
+                        directives: ForeignKeyDirectives {
+                            local_name: directive_fkey.local_name.clone(),
+                            foreign_name: directive_fkey.foreign_name.clone(),
+                        },
+                    };
 
-                // Verify all foreign column references are valid
-                if !directive_fkey
-                    .foreign_columns
-                    .iter()
-                    .all(|col| referenced_t_column_names.contains(col))
-                {
-                    // Skip if invalid references exist
-                    continue;
+                    fkeys.push(Arc::new(fk));
                 }
-
-                let fk = ForeignKey {
-                    local_table_meta: ForeignKeyTableInfo {
-                        oid: table.oid,
-                        name: table.name.clone(),
-                        schema: table.schema.clone(),
-                        is_rls_enabled: table.is_rls_enabled,
-                        column_names: directive_fkey.local_columns.clone(),
-                    },
-                    referenced_table_meta: ForeignKeyTableInfo {
-                        oid: referenced_t.oid,
-                        name: referenced_t.name.clone(),
-                        schema: referenced_t.schema.clone(),
-                        is_rls_enabled: table.is_rls_enabled,
-                        column_names: directive_fkey.foreign_columns.clone(),
-                    },
-                    directives: ForeignKeyDirectives {
-                        local_name: directive_fkey.local_name.clone(),
-                        foreign_name: directive_fkey.foreign_name.clone(),
-                    },
-                };
-
-                fkeys.push(Arc::new(fk));
             }
-        }
 
-        fkeys
-            .into_iter()
-            .filter(|fk| self.fkey_is_selectable(fk))
-            .collect()
+            fkeys
+                .into_iter()
+                .filter(|fk| self.fkey_is_selectable(fk))
+                .collect()
+        })
     }
 
     /// Check if a type is a composite type
